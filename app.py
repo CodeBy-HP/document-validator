@@ -1,9 +1,13 @@
 # app.py
 import streamlit as st
 import os
+import pandas as pd
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.ai.documentintelligence.models import AnalyzeDocumentRequest
+from comparer import match_documents, process_document_pairs, generate_comparison_report
+from utils import save_upload_file, display_comparison_results, display_unmatched_documents, display_matching_info
+from azure_processor import extract_document_fields
 
 # --- CONFIGURATION ---
 st.set_page_config(
@@ -12,6 +16,28 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed"
 )
+
+# Enable/disable debug mode
+DEBUG_MODE = False
+
+# Initialize session state variables
+if 'saved_files' not in st.session_state:
+    st.session_state.saved_files = []
+    
+if 'comparison_results' not in st.session_state:
+    st.session_state.comparison_results = None
+    
+if 'unmatched_invoices' not in st.session_state:
+    st.session_state.unmatched_invoices = []
+    
+if 'unmatched_pos' not in st.session_state:
+    st.session_state.unmatched_pos = []
+    
+if 'matched_pairs' not in st.session_state:
+    st.session_state.matched_pairs = []
+    
+if 'comparison_df' not in st.session_state:
+    st.session_state.comparison_df = None
 
 # --- AZURE DOCUMENT INTELLIGENCE ANALYSIS FUNCTION ---
 
@@ -118,7 +144,7 @@ def analyze_invoice(doc_path, endpoint, key):
 # --- STREAMLIT UI ---
 
 st.title("📄 Document Validator")
-st.markdown("Use Azure's AI Document Intelligence to extract information from invoices.")
+st.markdown("Validate invoices against purchase orders using Azure AI Document Intelligence.")
 
 try:
     AZURE_ENDPOINT = st.secrets["azure"]["endpoint"]
@@ -130,57 +156,217 @@ except (KeyError, FileNotFoundError):
 UPLOADS_DIR = "uploads"
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 
-col1, col2 = st.columns([0.4, 0.6])
+# Sidebar for mode selection
+st.sidebar.title("Options")
+mode = st.sidebar.radio(
+    "Select Mode",
+    ["Document Validation", "Document Analysis"],
+    index=0,
+    help="Choose 'Document Validation' to compare invoices with purchase orders or 'Document Analysis' to analyze individual documents."
+)
 
-with col1:
-    st.header("1. Upload Files")
+# Main content area
+if mode == "Document Validation":
+    st.header("Document Validation")
+    st.markdown("""
+    Upload invoice and purchase order PDFs for bulk validation.
+    - Invoices should be named as INV-#.pdf or INV.-#.pdf
+    - Purchase orders should be named as PO-#.pdf
+    - The system will match documents based on their numbers and compare key fields.
+    """)
+    
+    # File upload section
+    st.subheader("1. Upload Documents")
     uploaded_files = st.file_uploader(
-        "Select one or more PDF invoices for analysis.",
+        "Select invoice and purchase order PDFs for validation",
         type=["pdf"],
         accept_multiple_files=True,
-        help="You can upload multiple PDF files at once."
+        help="Upload both invoice and purchase order documents. File naming convention: INV-#.pdf and PO-#.pdf",
+        key="document_uploader"
     )
 
-    saved_files = []
+    # Clear results when new files are uploaded
+    if uploaded_files and uploaded_files != st.session_state.get('last_uploaded_files'):
+        st.session_state.saved_files = []
+        st.session_state.comparison_results = None
+        st.session_state.unmatched_invoices = []
+        st.session_state.unmatched_pos = []
+        st.session_state.comparison_df = None
+        st.session_state.last_uploaded_files = uploaded_files
+
     if uploaded_files:
-        for uploaded_file in uploaded_files:
-            file_path = os.path.join(UPLOADS_DIR, uploaded_file.name)
-            with open(file_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
-            saved_files.append(file_path)
-        
-        st.success(f"Successfully uploaded {len(saved_files)} file(s). Ready to process.")
+        # Only process new uploads if saved_files is empty
+        if not st.session_state.saved_files:
+            for uploaded_file in uploaded_files:
+                file_path = save_upload_file(uploaded_file, UPLOADS_DIR)
+                st.session_state.saved_files.append(file_path)
+            
+            st.success(f"Successfully uploaded {len(st.session_state.saved_files)} file(s). Ready to process.")
 
-with col2:
-    st.header("2. Process & View Results")
-    st.markdown("Click the button below to start the analysis. Results will appear here.")
+    # Processing section
+    st.subheader("2. Validate Documents")
     
-    process_button = st.button("Process Files", type="primary", disabled=not saved_files)
-
-if process_button:
-    results_container = st.container()
+    # Add two columns for buttons
+    col1, col2 = st.columns([1, 1])
     
-    with results_container:
-        st.info("Processing... please wait.")
+    with col1:
+        process_button = st.button("Process Files", type="primary", disabled=not st.session_state.saved_files)
         
-        with st.spinner("Analyzing documents with Azure AI..."):
-            all_results = {}
-            for file_path in saved_files:
-                file_name = os.path.basename(file_path)
-                analysis_result_str = analyze_invoice(file_path, AZURE_ENDPOINT, AZURE_KEY)
-                all_results[file_name] = analysis_result_str
+    with col2:
+        # Reset button to clear session state
+        if st.button("Reset", type="secondary"):
+            st.session_state.saved_files = []
+            st.session_state.comparison_results = None
+            st.session_state.unmatched_invoices = []
+            st.session_state.unmatched_pos = []
+            st.session_state.matched_pairs = []
+            st.session_state.comparison_df = None
+            st.rerun()
+
+    if process_button:
+        results_container = st.container()
+        
+        with results_container:
+            # Only process if results aren't already in session state
+            if st.session_state.comparison_results is None:
+                with st.spinner("Processing documents..."):
+                    # Debug info - Show uploaded files
+                    if DEBUG_MODE:
+                        st.write("Uploaded Files:", [os.path.basename(f) for f in st.session_state.saved_files])
+                    
+                    # Match invoice and PO documents based on naming
+                    matched_pairs, unmatched_invoices, unmatched_pos = match_documents(st.session_state.saved_files)
+                    
+                    # Debug info - Show matched pairs
+                    if DEBUG_MODE and matched_pairs:
+                        st.write("Matched Pairs:")
+                        for pair in matched_pairs:
+                            st.write(f"- Invoice: {os.path.basename(pair['invoice'])} ↔ PO: {os.path.basename(pair['purchase_order'])}")
+                    
+                    if not matched_pairs:
+                        st.error("No matching invoice-purchase order pairs were found. Please check your file naming.")
+                        st.stop()
+                    
+                    st.info(f"Found {len(matched_pairs)} matching document pairs. Processing comparisons...")
+                    
+                    # Process each document pair and compare fields
+                    comparison_results = process_document_pairs(matched_pairs, AZURE_ENDPOINT, AZURE_KEY)
+                    
+                    # Store results in session state
+                    st.session_state.comparison_results = comparison_results
+                    st.session_state.unmatched_invoices = unmatched_invoices
+                    st.session_state.unmatched_pos = unmatched_pos
+                    st.session_state.matched_pairs = matched_pairs
+                    
+                    # Generate report and store in session state
+                    st.session_state.comparison_df = generate_comparison_report(comparison_results)
+                    
+                    # Show success message
+                    st.success(f"Processed {len(comparison_results)} document pairs.")
+            
+            # Always display results if available in session state
+            if st.session_state.comparison_results:
+                # Display comparison results
+                display_comparison_results(st.session_state.comparison_results)
                 
-                print(f"--- CONSOLE OUTPUT FOR {file_name} ---")
-                print(analysis_result_str)
-                print("------------------------------------------\n")
+                # Display unmatched documents
+                display_unmatched_documents(st.session_state.unmatched_invoices, st.session_state.unmatched_pos)
+                
+                # Display file matching information
+                if hasattr(st.session_state, 'matched_pairs'):
+                    display_matching_info(st.session_state.matched_pairs, st.session_state.saved_files)
+                
+                # Export option for results
+                if st.session_state.comparison_df is not None and not st.session_state.comparison_df.empty:
+                    # Using BytesIO to create in-memory Excel file
+                    import io
+                    buffer = io.BytesIO()
+                    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                        st.session_state.comparison_df.to_excel(writer, index=False, sheet_name='Validation Report')
+                    
+                    # Get the bytes value from the buffer
+                    excel_data = buffer.getvalue()
+                    
+                    st.download_button(
+                        label="Download Comparison Report (Excel)",
+                        data=excel_data,
+                        file_name="document_validation_report.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
 
-        st.success("Analysis complete!")
+else:  # Document Analysis mode
+    st.header("Document Analysis")
+    st.markdown("Upload and analyze individual documents to see extracted information.")
+    
+    # Initialize session state for analysis mode
+    if 'analysis_saved_files' not in st.session_state:
+        st.session_state.analysis_saved_files = []
+        
+    if 'analysis_results' not in st.session_state:
+        st.session_state.analysis_results = None
+    
+    # File upload section
+    uploaded_files = st.file_uploader(
+        "Select one or more PDF documents for analysis",
+        type=["pdf"],
+        accept_multiple_files=True,
+        help="You can upload multiple PDF files at once.",
+        key="analysis_uploader"
+    )
 
-        if all_results:
-            tab_titles = list(all_results.keys())
-            tabs = st.tabs(tab_titles)
+    # Clear results when new files are uploaded
+    if uploaded_files and uploaded_files != st.session_state.get('last_analysis_uploaded_files'):
+        st.session_state.analysis_saved_files = []
+        st.session_state.analysis_results = None
+        st.session_state.last_analysis_uploaded_files = uploaded_files
 
-            for i, tab in enumerate(tabs):
-                with tab:
-                    st.header(f"Extracted Data for: `{tab_titles[i]}`")
-                    st.code(all_results[tab_titles[i]], language=None)
+    if uploaded_files:
+        # Only process new uploads if saved_files is empty
+        if not st.session_state.analysis_saved_files:
+            for uploaded_file in uploaded_files:
+                file_path = save_upload_file(uploaded_file, UPLOADS_DIR)
+                st.session_state.analysis_saved_files.append(file_path)
+            
+            st.success(f"Successfully uploaded {len(st.session_state.analysis_saved_files)} file(s). Ready to process.")
+
+    # Add two columns for buttons
+    col1, col2 = st.columns([1, 1])
+    
+    with col1:
+        process_button = st.button("Process Files", type="primary", disabled=not st.session_state.analysis_saved_files)
+        
+    with col2:
+        # Reset button to clear session state
+        if st.button("Reset", type="secondary"):
+            st.session_state.analysis_saved_files = []
+            st.session_state.analysis_results = None
+            st.rerun()
+
+    # Only process if results aren't already in session state or if process button was clicked
+    if process_button and (st.session_state.analysis_results is None):
+        results_container = st.container()
+        
+        with results_container:
+            st.info("Processing... please wait.")
+            
+            with st.spinner("Analyzing documents with Azure AI..."):
+                all_results = {}
+                for file_path in st.session_state.analysis_saved_files:
+                    file_name = os.path.basename(file_path)
+                    analysis_result_str = analyze_invoice(file_path, AZURE_ENDPOINT, AZURE_KEY)
+                    all_results[file_name] = analysis_result_str
+                
+                # Store results in session state
+                st.session_state.analysis_results = all_results
+
+            st.success("Analysis complete!")
+    
+    # Always display results if available in session state
+    if st.session_state.analysis_results:
+        tab_titles = list(st.session_state.analysis_results.keys())
+        tabs = st.tabs(tab_titles)
+
+        for i, tab in enumerate(tabs):
+            with tab:
+                st.header(f"Extracted Data for: `{tab_titles[i]}`")
+                st.code(st.session_state.analysis_results[tab_titles[i]], language=None)
