@@ -4,3 +4,5 @@ pandas
 openpyxl
 regex
 python-Levenshtein
+memory-profiler
+psutil
